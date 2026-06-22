@@ -16,9 +16,12 @@ app = FastAPI()
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+openai_client = OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com",
+)
 
 # Хэрэглэгч тус бүрийн яриа хадгалдаг санах ой (in-memory)
 conversation_histories: dict[str, list] = defaultdict(list)
@@ -117,7 +120,7 @@ def extract_order(reply_text: str) -> tuple[str, dict | None]:
 
 def call_openai(history: list) -> str:
     response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="deepseek-chat",
         messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
         timeout=30,
     )

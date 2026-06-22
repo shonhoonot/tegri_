@@ -9,7 +9,7 @@ services:
         sync: false
       - key: PAGE_ACCESS_TOKEN
         sync: false
-      - key: OPENAI_API_KEY
+      - key: DEEPSEEK_API_KEY
         sync: false
       - key: TELEGRAM_BOT_TOKEN
         sync: false
