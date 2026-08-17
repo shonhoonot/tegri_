@@ -1,7 +1,9 @@
 import re
 import json
 import os
-from collections import defaultdict
+import logging
+import asyncio
+from collections import defaultdict, OrderedDict
 
 from dotenv import load_dotenv
 import httpx
@@ -11,6 +13,9 @@ from fastapi import FastAPI, Request, Response
 from openai import OpenAI
 
 from telegram import send_lead_notification
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("tegri")
 
 app = FastAPI()
 
@@ -26,6 +31,20 @@ openai_client = OpenAI(
 # Хэрэглэгч тус бүрийн яриа хадгалдаг санах ой (in-memory)
 conversation_histories: dict[str, list] = defaultdict(list)
 
+# Meta webhook давхардуулж (retry) илгээсэн мессежийг дахин боловсруулахгүйн тулд.
+# OrderedDict тул хамгийн эрт үзсэн mid-ийг хасаж, санах ойг хязгаарлана.
+_seen_message_ids: OrderedDict[str, None] = OrderedDict()
+_SEEN_CAP = 1000
+
+
+def already_seen(mid: str) -> bool:
+    if mid in _seen_message_ids:
+        return True
+    _seen_message_ids[mid] = None
+    while len(_seen_message_ids) > _SEEN_CAP:
+        _seen_message_ids.popitem(last=False)
+    return False
+
 SYSTEM_PROMPT = """# ҮҮРЭГ
 Чи бол "тэгри_" дэлгүүрийн борлуулалтын туслах. Нуруу сунгалтын тавцан зардаг.
 Зорилго: үйлчлүүлэгчтэй найрсаг харьцаж, бүтээгдэхүүний талаар мэдээлэл өгч,
@@ -40,15 +59,19 @@ SYSTEM_PROMPT = """# ҮҮРЭГ
 
 # БҮТЭЭГДЭХҮҮНИЙ МЭДЭЭЛЭЛ
 Нэр: Нуруу сунгалтын тавцан
-Үнэ: 450,000₮
+Үнэ: 380,000₮
 Хүргэлт: 10,000₮
 Угсралт: 10,000₮
 Холбоо барих утас: 99194217
 
+Угсралт ба хэрэглээ:
+1-р алхам: Дэлгэх, боолтоо нүхэнд нь хийх, чангалах
+2-р алхам: Нуруугаа сунгаж хэвтэх
+
 Ач холбогдол:
-- Нурууны нугалам хоорондын зай тэлж, мэдрэлийн язгуур чөлөөлөгдөнө
-- Нурууны булчин болон холбогч эдийг сунгана
-- Нугалам хоорондын жийргэвчийн гадна цагирагийг чангаруулж, дотор бөөмөнд ирэх ачааллыг багасгана
+- Нуруу өвддөг хүмүүст туслана
+- Нурууны үений суулттай хүмүүст тохиромжтой
+- Нурууны үе хоорондын мэдрэлийн судлууд дарагдсан нурууны мурийлттай хүмүүс хэрэглэвэл тохиромжтой
 
 # ЭСРЭГ ЗААЛТ (заавал анхааруулах)
 Дараах тохиолдолд тавцан дээрх сунгалтын эмчилгээ ХИЙХГҮЙ:
@@ -87,7 +110,7 @@ SYSTEM_PROMPT = """# ҮҮРЭГ
   "phone": "<утасны дугаар>",
   "address": "<бүтэн хаяг>",
   "product": "Нуруу сунгалтын тавцан",
-  "price": 450000,
+  "price": 380000,
   "delivery": 10000,
   "assembly": 10000,
   "note": "<нэмэлт тэмдэглэл байвал>"
@@ -164,22 +187,36 @@ async def handle_webhook(request: Request):
             sender_id = event.get("sender", {}).get("id")
             message = event.get("message", {})
             text = message.get("text")
+            mid = message.get("mid")
 
             if not sender_id or not text:
                 continue
 
+            if mid and already_seen(mid):
+                log.info("skip duplicate mid=%s sender=%s", mid, sender_id)
+                continue
+
+            log.info("recv sender=%s mid=%s text=%r", sender_id, mid, text)
+
             history = conversation_histories[sender_id]
             history.append({"role": "user", "content": text})
 
-            reply = call_openai(history)
+            try:
+                reply = await asyncio.to_thread(call_openai, history)
+            except Exception:
+                log.exception("call_openai failed sender=%s", sender_id)
+                continue
 
             user_text, order = extract_order(reply)
 
             history.append({"role": "assistant", "content": user_text})
 
+            log.info("reply sender=%s order=%s text=%r", sender_id, bool(order), user_text)
+
             send_messenger_reply(sender_id, user_text)
 
             if order:
+                log.info("order sender=%s phone=%s", sender_id, order.get("phone"))
                 send_lead_notification(order)
 
     return {"status": "ok"}
