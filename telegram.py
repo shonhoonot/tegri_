@@ -10,7 +10,7 @@ def send_lead_notification(order: dict) -> None:
     phone = order.get("phone", "")
     address = order.get("address", "")
     note = order.get("note") or ""
-    price = order.get("price", 380000)
+    price = order.get("price", 450000)
     delivery = order.get("delivery", 10000)
     assembly = order.get("assembly", 10000)
 
