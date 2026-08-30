@@ -1,9 +1,11 @@
 import re
 import json
 import os
+import hmac
+import hashlib
 import logging
 import asyncio
-from collections import defaultdict, OrderedDict
+from collections import OrderedDict
 
 from dotenv import load_dotenv
 import httpx
@@ -27,19 +29,43 @@ ASSEMBLY = 10000
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+# Meta App Secret. Тохируулбал webhook бүрийн гарын үсгийг шалгана.
+APP_SECRET = os.getenv("APP_SECRET")
+
+# Алдаа гарсан үед үйлчлүүлэгчийг чимээгүй орхихгүйн тулд
+FALLBACK_ERROR = (
+    "Уучлаарай, түр зуурын алдаа гарлаа. Дахин бичихэд хариулъя, "
+    "эсвэл 99194217 дугаар руу холбогдоно уу."
+)
+FALLBACK_ORDER_OK = (
+    "Захиалгыг тань хүлээн авлаа. Манай ажилтан тантай удахгүй "
+    "холбогдоно. Баярлалаа!"
+)
+FALLBACK_NON_TEXT = (
+    "Уучлаарай, зураг болон хавсралтыг уншиж чадахгүй байна. "
+    "Асуултаа бичиж илгээвэл хариулъя, эсвэл 99194217 руу холбогдоно уу."
+)
 
 openai_client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com",
 )
 
-# Хэрэглэгч тус бүрийн яриа хадгалдаг санах ой (in-memory)
-conversation_histories: dict[str, list] = defaultdict(list)
+# Бүх төлөв процессын санах ойд байгаа тул restart болгонд арчигдана.
+# Тиймээс бүгд ХЯЗГААРТАЙ — удаан ажиллахад санах ой хязгааргүй өсөхөөс сэргийлнэ.
 
-# Meta webhook давхардуулж (retry) илгээсэн мессежийг дахин боловсруулахгүйн тулд.
-# OrderedDict тул хамгийн эрт үзсэн mid-ийг хасаж, санах ойг хязгаарлана.
+# Хэрэглэгч тус бүрийн яриа. Хамгийн эрт хэрэглэсэн хэрэглэгчийг эхэлж хасна.
+conversation_histories: OrderedDict[str, list] = OrderedDict()
+_MAX_USERS = 500
+_MAX_HISTORY = 20  # 10 ээлж; үүнээс хэтэрвэл эхнээс нь тасална
+
+# Meta webhook давхардуулж (retry) илгээсэн мессежийг дахин боловсруулахгүйн тулд
 _seen_message_ids: OrderedDict[str, None] = OrderedDict()
 _SEEN_CAP = 1000
+
+# Нэг захиалгыг Telegram руу дахин дахин илгээхээс сэргийлнэ
+_sent_orders: OrderedDict[str, None] = OrderedDict()
+_ORDER_CAP = 500
 
 
 def already_seen(mid: str) -> bool:
@@ -49,6 +75,54 @@ def already_seen(mid: str) -> bool:
     while len(_seen_message_ids) > _SEEN_CAP:
         _seen_message_ids.popitem(last=False)
     return False
+
+
+def get_history(sender_id: str) -> list:
+    """Хэрэглэгчийн ярианы түүхийг авна (LRU: хамгийн эрт хэрэглэснийг хасна)."""
+    if sender_id in conversation_histories:
+        conversation_histories.move_to_end(sender_id)
+    else:
+        conversation_histories[sender_id] = []
+        while len(conversation_histories) > _MAX_USERS:
+            conversation_histories.popitem(last=False)
+    return conversation_histories[sender_id]
+
+
+def trim_history(history: list) -> None:
+    """Түүхийг таслана. Эхний мессеж үргэлж user байхаар үлдээнэ."""
+    if len(history) > _MAX_HISTORY:
+        del history[: len(history) - _MAX_HISTORY]
+    if history and history[0]["role"] == "assistant":
+        del history[0]
+
+
+def order_already_sent(sender_id: str, order: dict) -> bool:
+    """Ижил захиалга (утас + хаяг) аль хэдийн илгээгдсэн эсэхийг шалгана."""
+    phone = re.sub(r"\D", "", str(order.get("phone", "")))
+    address = " ".join(str(order.get("address", "")).lower().split())
+    key = f"{sender_id}|{phone}|{address}"
+
+    if key in _sent_orders:
+        return True
+    _sent_orders[key] = None
+    while len(_sent_orders) > _ORDER_CAP:
+        _sent_orders.popitem(last=False)
+    return False
+
+
+def verify_signature(raw_body: bytes, header: str | None) -> bool:
+    """Meta-гийн X-Hub-Signature-256 гарын үсгийг шалгана.
+
+    APP_SECRET тохируулаагүй бол шалгахгүй өнгөрүүлнэ — ингэснээр
+    env хувьсагч нэмэхээс өмнө ажиллаж байгаа bot зогсохгүй.
+    """
+    if not APP_SECRET:
+        return True
+    if not header or not header.startswith("sha256="):
+        return False
+    expected = hmac.new(APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header[len("sha256="):])
+
 
 SYSTEM_PROMPT = """# ҮҮРЭГ
 Чи бол "тэгри_" дэлгүүрийн борлуулалтын туслах. Нуруу сунгалтын тавцан зардаг.
@@ -168,8 +242,9 @@ def call_openai(history: list) -> str:
     return response.choices[0].message.content
 
 
-def send_messenger_reply(recipient_id: str, text: str) -> None:
-    url = f"https://graph.facebook.com/v19.0/me/messages"
+def send_messenger_reply(recipient_id: str, text: str) -> bool:
+    """Messenger руу хариу илгээнэ. Амжилттай эсэхийг буцаана."""
+    url = "https://graph.facebook.com/v19.0/me/messages"
     payload = {
         "recipient": {"id": recipient_id},
         "message": {"text": text},
@@ -177,9 +252,24 @@ def send_messenger_reply(recipient_id: str, text: str) -> None:
     params = {"access_token": PAGE_ACCESS_TOKEN}
     try:
         with httpx.Client(timeout=10.0) as client:
-            client.post(url, json=payload, params=params)
-    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.RequestError):
-        pass
+            resp = client.post(url, json=payload, params=params)
+    except httpx.RequestError as exc:
+        # ReadTimeout, ConnectTimeout зэрэг нь RequestError-ийн удам
+        log.error("messenger request failed recipient=%s err=%s", recipient_id, exc)
+        return False
+
+    if resp.status_code >= 400:
+        log.error(
+            "messenger rejected recipient=%s status=%s body=%s",
+            recipient_id, resp.status_code, resp.text[:500],
+        )
+        return False
+    return True
+
+
+async def send_reply(recipient_id: str, text: str) -> bool:
+    """Blocking HTTP дуудлагыг event loop-оос гаргана."""
+    return await asyncio.to_thread(send_messenger_reply, recipient_id, text)
 
 
 @app.get("/webhook")
@@ -188,53 +278,105 @@ async def verify_webhook(request: Request):
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
 
-    if mode == "subscribe" and token == VERIFY_TOKEN:
+    # VERIFY_TOKEN тохируулаагүй бол None == None болж өнгөрөхөөс сэргийлнэ
+    if mode == "subscribe" and VERIFY_TOKEN and token == VERIFY_TOKEN:
         return Response(content=challenge, media_type="text/plain")
     return Response(status_code=403)
 
 
+async def handle_event(event: dict) -> None:
+    sender_id = event.get("sender", {}).get("id")
+    message = event.get("message") or {}
+
+    if not sender_id or not message:
+        return
+
+    # Хуудас өөрөө илгээсэн мессежийн echo — үүнд хариулбал давталтад орно
+    if message.get("is_echo"):
+        return
+
+    mid = message.get("mid")
+    if mid and already_seen(mid):
+        log.info("skip duplicate mid=%s sender=%s", mid, sender_id)
+        return
+
+    text = message.get("text")
+    if not text:
+        log.info("non-text message sender=%s mid=%s", sender_id, mid)
+        await send_reply(sender_id, FALLBACK_NON_TEXT)
+        return
+
+    log.info("recv sender=%s mid=%s text=%r", sender_id, mid, text)
+
+    history = get_history(sender_id)
+    history.append({"role": "user", "content": text})
+    trim_history(history)
+
+    try:
+        reply = await asyncio.to_thread(call_openai, history)
+    except Exception:
+        log.exception("call_openai failed sender=%s", sender_id)
+        await send_reply(sender_id, FALLBACK_ERROR)
+        return
+
+    if not reply:
+        log.error("empty LLM reply sender=%s", sender_id)
+        await send_reply(sender_id, FALLBACK_ERROR)
+        return
+
+    try:
+        user_text, order = extract_order(reply)
+    except Exception:
+        log.exception("extract_order failed sender=%s reply=%r", sender_id, reply)
+        await send_reply(sender_id, FALLBACK_ERROR)
+        return
+
+    # Загвар зөвхөн ORDER JSON буцаавал хэрэглэгч хоосон мессеж авахгүй байх ёстой
+    if not user_text:
+        user_text = FALLBACK_ORDER_OK if order else FALLBACK_ERROR
+
+    history.append({"role": "assistant", "content": user_text})
+    trim_history(history)
+
+    log.info("reply sender=%s order=%s text=%r", sender_id, bool(order), user_text)
+    await send_reply(sender_id, user_text)
+
+    if not order:
+        return
+
+    if order_already_sent(sender_id, order):
+        log.info("skip duplicate order sender=%s phone=%s", sender_id, order.get("phone"))
+        return
+
+    log.info("order sender=%s phone=%s", sender_id, order.get("phone"))
+    sent = await asyncio.to_thread(send_lead_notification, order)
+    if not sent:
+        log.error("LEAD NOT DELIVERED sender=%s order=%s", sender_id, order)
+
+
 @app.post("/webhook")
 async def handle_webhook(request: Request):
-    body = await request.json()
+    raw = await request.body()
+
+    if not verify_signature(raw, request.headers.get("X-Hub-Signature-256")):
+        log.warning("rejected webhook with invalid signature")
+        return Response(status_code=403)
+
+    try:
+        body = json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("webhook body is not valid JSON")
+        return Response(status_code=400)
 
     if body.get("object") != "page":
         return Response(status_code=404)
 
     for entry in body.get("entry", []):
         for event in entry.get("messaging", []):
-            sender_id = event.get("sender", {}).get("id")
-            message = event.get("message", {})
-            text = message.get("text")
-            mid = message.get("mid")
-
-            if not sender_id or not text:
-                continue
-
-            if mid and already_seen(mid):
-                log.info("skip duplicate mid=%s sender=%s", mid, sender_id)
-                continue
-
-            log.info("recv sender=%s mid=%s text=%r", sender_id, mid, text)
-
-            history = conversation_histories[sender_id]
-            history.append({"role": "user", "content": text})
-
+            # Нэг event уналаа гээд бусдыг нь тасалдуулахгүй
             try:
-                reply = await asyncio.to_thread(call_openai, history)
+                await handle_event(event)
             except Exception:
-                log.exception("call_openai failed sender=%s", sender_id)
-                continue
-
-            user_text, order = extract_order(reply)
-
-            history.append({"role": "assistant", "content": user_text})
-
-            log.info("reply sender=%s order=%s text=%r", sender_id, bool(order), user_text)
-
-            send_messenger_reply(sender_id, user_text)
-
-            if order:
-                log.info("order sender=%s phone=%s", sender_id, order.get("phone"))
-                send_lead_notification(order)
+                log.exception("event handling failed: %s", event)
 
     return {"status": "ok"}
