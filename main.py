@@ -19,6 +19,11 @@ log = logging.getLogger("tegri")
 
 app = FastAPI()
 
+# Мөнгөн дүнгийн эх сурвалж — SYSTEM_PROMPT доторх тоог өөрчлөхдөө эдгээрийг ч бас өөрчил.
+PRICE = 450000
+DELIVERY = 10000
+ASSEMBLY = 10000
+
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
@@ -54,6 +59,10 @@ SYSTEM_PROMPT = """# ҮҮРЭГ
 - Зөвхөн монгол хэлээр, эелдэг, ойлгомжтой, товч бич.
 - Эмойжи хэт их бүү хэрэглэ (хааяа 1-2 хүртэл боломжтой).
 - Мэдэхгүй зүйлээ зохиож бүү хэл. Эргэлзвэл 99194217 руу холбогдохыг санал болго.
+- ТООН МЭДЭЭЛЛИЙГ (үнэ, хүргэлт, угсралт, даац, өндөр) доорх
+  "БҮТЭЭГДЭХҮҮНИЙ МЭДЭЭЛЭЛ" хэсэгт бичсэн ЯГ тэр тоогоор давтан бич.
+  Тоог хэзээ ч өөрчилж, дугуйлж, эсвэл өөрөө зохиож болохгүй.
+  Үнэ асуувал заавал "450,000₮" гэж бич — өөр ямар ч тоо буруу.
 - Эмчилгээний нарийн зөвлөгөө бүү өг — энэ нь эмчийн ажил. Эсрэг заалтыг л танилц.
 - Хүн худалдан авах сонирхол гаргамагц шууд захиалга авах руу шилж.
 
@@ -140,6 +149,11 @@ def extract_order(reply_text: str) -> tuple[str, dict | None]:
     if not order.get("phone") or not order.get("address"):
         return clean_text, None
 
+    # Мөнгөн дүн бол тогтмол утга — LLM-ийн бичсэнд бүү найд, дарж бич.
+    order["price"] = PRICE
+    order["delivery"] = DELIVERY
+    order["assembly"] = ASSEMBLY
+
     return clean_text, order
 
 
@@ -147,6 +161,8 @@ def call_openai(history: list) -> str:
     response = openai_client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
+        # Үнэ зэрэг тоог өөрөө зохиож хазайхаас сэргийлж temperature-г бага барина
+        temperature=0.2,
         timeout=30,
     )
     return response.choices[0].message.content
