@@ -13,13 +13,16 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 def _esc(value) -> str:
     """Хэрэглэгчээс ирсэн текстийг HTML-д аюулгүй болгоно."""
     text = str(value).strip() if value is not None else ""
-    return html.escape(text) if text else "—"
+    if not text or text.lower() in ("null", "none"):
+        return "—"
+    return html.escape(text)
 
 
 def _money(value, default: int) -> int:
-    """LLM тоог мөрөөр бичсэн ч format алдаа өгөхгүй байлгана."""
+    """LLM тоог мөрөөр эсвэл таслалтай бичсэн ч format алдаа өгөхгүй байлгана."""
     try:
-        return int(value)
+        clean = str(value).replace(",", "").strip()
+        return int(clean)
     except (TypeError, ValueError):
         return default
 

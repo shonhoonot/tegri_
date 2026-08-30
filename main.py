@@ -47,7 +47,7 @@ FALLBACK_NON_TEXT = (
 )
 
 openai_client = OpenAI(
-    api_key=DEEPSEEK_API_KEY,
+    api_key=DEEPSEEK_API_KEY or "missing_key",
     base_url="https://api.deepseek.com",
 )
 
@@ -96,18 +96,26 @@ def trim_history(history: list) -> None:
         del history[0]
 
 
-def order_already_sent(sender_id: str, order: dict) -> bool:
-    """Ижил захиалга (утас + хаяг) аль хэдийн илгээгдсэн эсэхийг шалгана."""
+def _normalize_order_key(sender_id: str, order: dict) -> str:
     phone = re.sub(r"\D", "", str(order.get("phone", "")))
+    if len(phone) == 11 and phone.startswith("976"):
+        phone = phone[3:]
     address = " ".join(str(order.get("address", "")).lower().split())
-    key = f"{sender_id}|{phone}|{address}"
+    return f"{sender_id}|{phone}|{address}"
 
-    if key in _sent_orders:
-        return True
+
+def is_order_already_sent(sender_id: str, order: dict) -> bool:
+    """Ижил захиалга (утас + хаяг) амжилттай илгээгдсэн эсэхийг шалгана."""
+    key = _normalize_order_key(sender_id, order)
+    return key in _sent_orders
+
+
+def mark_order_sent(sender_id: str, order: dict) -> None:
+    """Захиалга Telegram руу амжилттай илгээгдсэний дараа бүртгэнэ."""
+    key = _normalize_order_key(sender_id, order)
     _sent_orders[key] = None
     while len(_sent_orders) > _ORDER_CAP:
         _sent_orders.popitem(last=False)
-    return False
 
 
 def verify_signature(raw_body: bytes, header: str | None) -> bool:
@@ -204,7 +212,7 @@ SYSTEM_PROMPT = """# ҮҮРЭГ
 
 Захиалга бүрэн биш бол энэ JSON-ийг бүү гарга."""
 
-ORDER_RE = re.compile(r"<<<ORDER>>>(.*?)<<<ORDER>>>", re.DOTALL)
+ORDER_RE = re.compile(r"<<<ORDER>>>(.*?)(?:<<<ORDER>>>|$)", re.DOTALL | re.IGNORECASE)
 
 
 def extract_order(reply_text: str) -> tuple[str, dict | None]:
@@ -214,10 +222,26 @@ def extract_order(reply_text: str) -> tuple[str, dict | None]:
 
     raw = match.group(1).strip()
     clean_text = ORDER_RE.sub("", reply_text).strip()
+    # Текст дотор үлдсэн байж болзошгүй тагуудыг цэвэрлэнэ
+    clean_text = re.sub(r"<<<ORDER>>>", "", clean_text, flags=re.IGNORECASE).strip()
 
+    # Markdown code block (` ```json ... ``` `) орсон байвал тайлна
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw).strip()
+
+    order = None
     try:
         order = json.loads(raw)
     except json.JSONDecodeError:
+        # Хэрэв LLM өөр тайлбар бичсэн бол {...} хэсгийг сугалж туршина
+        brace_match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if brace_match:
+            try:
+                order = json.loads(brace_match.group(0))
+            except json.JSONDecodeError:
+                order = None
+
+    if not isinstance(order, dict):
         return clean_text, None
 
     if not order.get("phone") or not order.get("address"):
@@ -232,6 +256,9 @@ def extract_order(reply_text: str) -> tuple[str, dict | None]:
 
 
 def call_openai(history: list) -> str:
+    if not DEEPSEEK_API_KEY:
+        log.error("DEEPSEEK_API_KEY is missing in environment")
+        raise RuntimeError("DEEPSEEK_API_KEY is not configured")
     response = openai_client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "system", "content": SYSTEM_PROMPT}] + history,
@@ -272,6 +299,12 @@ async def send_reply(recipient_id: str, text: str) -> bool:
     return await asyncio.to_thread(send_messenger_reply, recipient_id, text)
 
 
+@app.get("/")
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "tegri-agent"}
+
+
 @app.get("/webhook")
 async def verify_webhook(request: Request):
     mode = request.query_params.get("hub.mode")
@@ -286,21 +319,31 @@ async def verify_webhook(request: Request):
 
 async def handle_event(event: dict) -> None:
     sender_id = event.get("sender", {}).get("id")
-    message = event.get("message") or {}
+    if not sender_id:
+        return
 
-    if not sender_id or not message:
+    message = event.get("message")
+    postback = event.get("postback")
+
+    if not message and not postback:
         return
 
     # Хуудас өөрөө илгээсэн мессежийн echo — үүнд хариулбал давталтад орно
-    if message.get("is_echo"):
+    if message and message.get("is_echo"):
         return
 
-    mid = message.get("mid")
-    if mid and already_seen(mid):
-        log.info("skip duplicate mid=%s sender=%s", mid, sender_id)
+    mid = message.get("mid") if message else None
+    event_id = mid or f"pb_{sender_id}_{event.get('timestamp')}"
+    if event_id and already_seen(event_id):
+        log.info("skip duplicate mid/event=%s sender=%s", event_id, sender_id)
         return
 
-    text = message.get("text")
+    if postback:
+        # "Get Started" эсвэл цэсний товчлуур дарагдсан үед
+        text = postback.get("title") or postback.get("payload") or "Сайн байна уу"
+    else:
+        text = message.get("text")
+
     if not text:
         log.info("non-text message sender=%s mid=%s", sender_id, mid)
         await send_reply(sender_id, FALLBACK_NON_TEXT)
@@ -344,13 +387,15 @@ async def handle_event(event: dict) -> None:
     if not order:
         return
 
-    if order_already_sent(sender_id, order):
+    if is_order_already_sent(sender_id, order):
         log.info("skip duplicate order sender=%s phone=%s", sender_id, order.get("phone"))
         return
 
     log.info("order sender=%s phone=%s", sender_id, order.get("phone"))
     sent = await asyncio.to_thread(send_lead_notification, order)
-    if not sent:
+    if sent:
+        mark_order_sent(sender_id, order)
+    else:
         log.error("LEAD NOT DELIVERED sender=%s order=%s", sender_id, order)
 
 
